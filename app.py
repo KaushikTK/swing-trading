@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_ta as ta
 import plotly.graph_objects as go
 import plotly.express as px
 import os
@@ -156,13 +155,11 @@ def process_ticker_data(ticker_df, low, high):
     if 'Date' not in df.columns:
         df = df.reset_index()
     
-    # Calculate Donchian Channels using pandas_ta
+    # Calculate Donchian Channels in pure pandas to avoid numba/pandas_ta compatibility issues on Python 3.14+
     try:
-        donchian = df.ta.donchian(lower_length=low, upper_length=high)
-        if donchian is not None and len(donchian.columns) >= 3:
-            df[['low', 'mid', 'high']] = donchian
-        else:
-            return None
+        df['low'] = df['Low'].rolling(window=low).min()
+        df['high'] = df['High'].rolling(window=high).max()
+        df['mid'] = (df['low'] + df['high']) / 2
     except Exception as e:
         return None
     
