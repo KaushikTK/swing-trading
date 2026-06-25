@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import os
 import urllib.request
+from multi_strategy import run_multi_strategy_backtest, run_pretrade_screening
 
 # Set page configuration
 st.set_page_config(
@@ -123,6 +124,8 @@ if 'today_buy_signals' not in st.session_state:
     st.session_state['today_buy_signals'] = []
 if 'backtest_tickers_selection' not in st.session_state:
     st.session_state['backtest_tickers_selection'] = ['EICHERMOT.NS', 'HEROMOTOCO.NS'] if 'EICHERMOT.NS' in all_tickers else all_tickers[:2]
+if 'backtest_tickers_selection_t4' not in st.session_state:
+    st.session_state['backtest_tickers_selection_t4'] = ['EICHERMOT.NS', 'HEROMOTOCO.NS'] if 'EICHERMOT.NS' in all_tickers else all_tickers[:2]
 
 def load_buy_signals_to_backtest():
     if st.session_state.get('today_buy_signals'):
@@ -130,6 +133,15 @@ def load_buy_signals_to_backtest():
         st.session_state['load_signals_warning'] = False
     else:
         st.session_state['load_signals_warning'] = True
+
+def load_buy_signals_to_backtest_t4():
+    if st.session_state.get('today_buy_signals'):
+        st.session_state['backtest_tickers_selection_t4'] = st.session_state['today_buy_signals']
+        st.session_state['load_signals_warning_t4'] = False
+        st.session_state['show_pretrade_screening'] = True
+    else:
+        st.session_state['load_signals_warning_t4'] = True
+        st.session_state['show_pretrade_screening'] = False
 
 # Caching yfinance downloads for 1 hour
 @st.cache_data(ttl=3600)
@@ -275,7 +287,7 @@ with st.expander("🌐 Live Index Fetch Status details", expanded=False):
         st.write(f"**{idx_name}**: {status}")
 
 # App Tabs
-tab1, tab2, tab3 = st.tabs(["📊 Daily Signals", "📈 Backtesting", "💼 Current Open Trades"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Daily Signals", "📈 Simple Backtest", "💼 Current Open Trades", "🧪 Advanced Backtest", "ℹ️ About"])
 
 # ----------------- TAB 1: DAILY SIGNALS -----------------
 with tab1:
@@ -361,7 +373,7 @@ with tab1:
                 st.subheader("🟢 Active Buy Signals (Buy on Next Open)")
                 if buy_signals_list:
                     buy_df = pd.DataFrame(buy_signals_list)
-                    st.dataframe(buy_df, use_container_width=True)
+                    st.dataframe(buy_df, width="stretch")
                     st.download_button("Export Buy Signals", buy_df.to_csv(index=False), "buy_signals.csv", "text/csv")
                 else:
                     st.info("No active Buy signals detected today.")
@@ -370,7 +382,7 @@ with tab1:
                 st.subheader("🔴 Active Sell Signals (Sell on Next Open)")
                 if sell_signals_list:
                     sell_df = pd.DataFrame(sell_signals_list)
-                    st.dataframe(sell_df, use_container_width=True)
+                    st.dataframe(sell_df, width="stretch")
                     st.download_button("Export Sell Signals", sell_df.to_csv(index=False), "sell_signals.csv", "text/csv")
                 else:
                     st.info("No active Sell signals detected today.")
@@ -467,7 +479,7 @@ with tab2:
         m_col4.metric("Total P&L (₹)", f"₹{res['total_pnl_val']:,.2f}")
         
         # Checkbox for Ticker-Level breakdown
-        show_ticker_breakdown = st.checkbox("📊 Show Ticker-Level Stats")
+        show_ticker_breakdown = st.checkbox("📊 Show Ticker-Level Stats", value=not run_all_backtest)
         if show_ticker_breakdown:
             st.subheader("Ticker-Level Backtest Breakdown")
             if not closed_trades.empty:
@@ -488,19 +500,19 @@ with tab2:
                         "Realized P&L (₹)": round(pnl_val, 2),
                         "Avg Hold (Days)": round(avg_hold_val, 1)
                     })
-                st.dataframe(pd.DataFrame(ticker_stats), use_container_width=True)
+                st.dataframe(pd.DataFrame(ticker_stats), width="stretch")
             else:
                 st.info("No closed trades to calculate ticker stats.")
                 
         st.subheader("Detailed Trade Logs")
-        st.dataframe(trades_df.sort_values(by='buy_date', ascending=False), use_container_width=True)
+        st.dataframe(trades_df.sort_values(by='buy_date', ascending=False), width="stretch")
         
         # Performance plot
         if not closed_trades.empty:
             closed_trades = closed_trades.sort_values(by='sell_date')
             closed_trades['Cumulative P&L'] = closed_trades['pnl'].cumsum()
             fig = px.line(closed_trades, x='sell_date', y='Cumulative P&L', title="Cumulative Realized Profit/Loss (₹)", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 # ----------------- TAB 3: CURRENT OPEN TRADES -----------------
 with tab3:
@@ -570,7 +582,7 @@ with tab3:
                         styled_df = open_trades_df.style.map(highlight_status, subset=['Status'])
                     else:
                         styled_df = open_trades_df.style.applymap(highlight_status, subset=['Status'])
-                    st.dataframe(styled_df, use_container_width=True)
+                    st.dataframe(styled_df, width="stretch")
                     
                     # Filter for exit signals
                     exits_only = [t for t in open_trades_list if '🚨' in t['Status']]
@@ -581,6 +593,277 @@ with tab3:
                     st.info("No active open positions detected across monitored tickers.")
             else:
                 st.error("Failed to load historical data.")
+
+# ----------------- TAB 4: MULTI-STRATEGY BACKTESTING -----------------
+with tab4:
+    st.header("🧪 Incremental Walk-Forward Backtesting")
+    st.markdown("""
+    This tab evaluates the strategy using an **Incremental Walk-Forward (walk-forward optimization)** approach:
+    1. The first $N$ trades (Warm-up phase) are bypassed for each stock to establish baseline metrics.
+    2. Subsequent trades (Walk-Forward phase) are entered only if the historical win rate and returns from **all previously generated signals** meet the criteria.
+    3. Running metrics are continuously updated trade-by-trade to adapt to changing market conditions.
+    """)
+
+    # Local Settings for Multi-Strategy Backtesting
+    with st.expander("⚙️ Strategy & Backtest Parameters", expanded=True):
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            position_size_m = st.number_input("Position Size (₹)", min_value=100, value=5000, step=500, key="pos_size_t4")
+        with col_m2:
+            commission_flat_m = st.number_input("Commission per Transaction (₹)", min_value=0.0, value=20.0, step=1.0, key="commission_t4")
+        with col_m3:
+            low_len_m = st.number_input("Lower Channel Length", min_value=5, max_value=100, value=20, key="low_len_t4")
+        with col_m4:
+            high_len_m = st.number_input("Upper Channel Length", min_value=5, max_value=100, value=20, key="high_len_t4")
+
+    # Hypothesis Parameters
+    with st.expander("🔬 Walk-Forward Filtering Criteria", expanded=True):
+        col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+        with col_h1:
+            metric_type = st.selectbox("Hypothesis Metric", ["Mean Return", "Median Return"], index=0, key="metric_type_t4")
+        with col_h2:
+            win_rate_threshold = st.slider("Min Win Rate (%)", min_value=0, max_value=100, value=75, step=5, key="wr_threshold_t4")
+        with col_h3:
+            min_return_threshold = st.number_input("Min Return / Trade (%)", value=0.0, step=0.5, key="ret_threshold_t4")
+        with col_h4:
+            warmup_trades = st.number_input("Warm-up Trades (Skip first N)", min_value=1, max_value=50, value=5, step=1, key="warmup_trades_t4")
+
+    # Backtest inputs
+    m_col1, m_col2, m_col3 = st.columns([2, 1, 1])
+    with m_col1:
+        backtest_selection_m = st.multiselect("Select Tickers", all_tickers, default=['EICHERMOT.NS', 'HEROMOTOCO.NS'] if 'EICHERMOT.NS' in all_tickers else all_tickers[:2], key="backtest_tickers_selection_t4")
+    with m_col2:
+        period_selection_m = st.selectbox("Backtest Duration", ["1y", "2y", "3y", "5y", "10y"], index=2, key="period_selection_t4")
+    with m_col3:
+        run_all_backtest_m = st.checkbox("Backtest all Nifty 500 tickers", key="run_all_t4")
+
+    # Display warning if loaded signals are empty
+    if st.session_state.get('load_signals_warning_t4', False):
+        st.warning("No Buy signals have been scanned yet today. Please run the scanner in the 'Daily Signals' tab first.")
+        st.session_state['load_signals_warning_t4'] = False
+
+    # Button to load today's buy signals
+    st.button("📋 Load Today's Buy Signals", key="load_signals_btn_t4", on_click=load_buy_signals_to_backtest_t4)
+
+    # Pre-trade screening panel for tomorrow's entries
+    if st.session_state.get('show_pretrade_screening', False) and st.session_state.get('backtest_tickers_selection_t4'):
+        st.subheader("🔍 Tomorrow's Entry Screening (Walk-Forward Rules)")
+        with st.spinner("Screening loaded signals against latest historical metrics..."):
+            screen_df = run_pretrade_screening(
+                tickers_to_screen=st.session_state['backtest_tickers_selection_t4'],
+                period_selection=period_selection_m,
+                position_size=position_size_m,
+                commission_flat=commission_flat_m,
+                low_len=low_len_m,
+                high_len=high_len_m,
+                metric_type=metric_type,
+                win_rate_threshold=win_rate_threshold,
+                min_return_threshold=min_return_threshold,
+                download_stock_data_fn=download_stock_data,
+                get_ticker_dataframe_fn=get_ticker_dataframe,
+                process_ticker_data_fn=process_ticker_data,
+                run_simulation_fn=run_simulation
+            )
+            if not screen_df.empty:
+                def highlight_action(row):
+                    bg_color = 'background-color: #d4edda; color: #155724; font-weight: bold;' if "Enter" in str(row['Action for Tomorrow']) else 'background-color: #f8d7da; color: #721c24; font-weight: bold;'
+                    return [bg_color] * len(row)
+                
+                if hasattr(screen_df.style, 'apply'):
+                    styled_screen = screen_df.style.apply(highlight_action, axis=1)
+                else:
+                    styled_screen = screen_df
+                st.dataframe(styled_screen, width="stretch")
+            else:
+                st.info("No screenable data could be retrieved.")
+
+    if st.button("🚀 Run Multi-Strategy Backtest", key="run_btn_t4"):
+        st.session_state['show_pretrade_screening'] = False
+        tickers_to_test = all_tickers if run_all_backtest_m else backtest_selection_m
+        
+        if not tickers_to_test:
+            st.warning("Please select at least one ticker.")
+        else:
+            with st.spinner(f"Running walk-forward backtest for {len(tickers_to_test)} tickers..."):
+                stats_df, all_trades, all_eval_unfiltered, all_eval_filtered = run_multi_strategy_backtest(
+                    tickers_to_test=tickers_to_test,
+                    period_selection=period_selection_m,
+                    position_size=position_size_m,
+                    commission_flat=commission_flat_m,
+                    low_len=low_len_m,
+                    high_len=high_len_m,
+                    metric_type=metric_type,
+                    win_rate_threshold=win_rate_threshold,
+                    min_return_threshold=min_return_threshold,
+                    warmup_trades=warmup_trades,
+                    download_stock_data_fn=download_stock_data,
+                    get_ticker_dataframe_fn=get_ticker_dataframe,
+                    process_ticker_data_fn=process_ticker_data,
+                    run_simulation_fn=run_simulation
+                )
+                
+                if not stats_df.empty:
+                    st.session_state['multi_backtest_results'] = {
+                        'stats_df': stats_df,
+                        'all_trades': all_trades,
+                        'all_eval_unfiltered': all_eval_unfiltered,
+                        'all_eval_filtered': all_eval_filtered
+                    }
+                else:
+                    st.warning("No backtest data could be generated.")
+
+    # Display results if available
+    if 'multi_backtest_results' in st.session_state:
+        res = st.session_state['multi_backtest_results']
+        stats_df = res['stats_df']
+        eval_unfiltered = res['all_eval_unfiltered']
+        eval_filtered = res['all_eval_filtered']
+        
+        # Summary calculations for Evaluation Period
+        unfiltered_total = len(eval_unfiltered)
+        unfiltered_wins = len([t for t in eval_unfiltered if t['returns'] > 0])
+        unfiltered_wr = (unfiltered_wins / unfiltered_total * 100) if unfiltered_total > 0 else 0.0
+        unfiltered_pnl = sum([t['pnl'] for t in eval_unfiltered])
+        unfiltered_avg_ret = np.mean([t['returns'] for t in eval_unfiltered]) if unfiltered_total > 0 else 0.0
+        
+        filtered_total = len(eval_filtered)
+        filtered_wins = len([t for t in eval_filtered if t['returns'] > 0])
+        filtered_wr = (filtered_wins / filtered_total * 100) if filtered_total > 0 else 0.0
+        filtered_pnl = sum([t['pnl'] for t in eval_filtered])
+        filtered_avg_ret = np.mean([t['returns'] for t in eval_filtered]) if filtered_total > 0 else 0.0
+        
+        # Display side-by-side comparison metrics
+        st.subheader("📊 Walk-Forward Evaluation Summary (Post-Warmup)")
+        col_sum1, col_sum2 = st.columns(2)
+        
+        with col_sum1:
+            st.markdown("### ⚠️ Standard Strategy (Unfiltered)")
+            st.metric("Total Trades", unfiltered_total)
+            st.metric("Win Rate %", f"{unfiltered_wr:.2f}%")
+            st.metric("Avg Return / Trade", f"{unfiltered_avg_ret:.2f}%")
+            st.metric("Total P&L (₹)", f"₹{unfiltered_pnl:,.2f}")
+            
+        with col_sum2:
+            st.markdown("### 🛡️ Filtered Strategy (Hypothesis)")
+            st.metric("Total Trades", filtered_total)
+            st.metric("Win Rate %", f"{filtered_wr:.2f}%")
+            st.metric("Avg Return / Trade", f"{filtered_avg_ret:.2f}%")
+            st.metric("Total P&L (₹)", f"₹{filtered_pnl:,.2f}")
+            
+        st.subheader("📋 Ticker-Level Walk-Forward Statistics")
+        st.dataframe(stats_df, width="stretch")
+        st.download_button("Export Ticker Stats", stats_df.to_csv(index=False), "ticker_walk_forward_stats.csv", "text/csv")
+        
+        st.subheader("📈 Cumulative P&L Comparison")
+        # Build cumulative line chart for both strategies
+        if eval_unfiltered:
+            df_unf = pd.DataFrame(eval_unfiltered).sort_values('sell_date')
+            df_unf['Cumulative P&L (Unfiltered)'] = df_unf['pnl'].cumsum()
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_unf['sell_date'], y=df_unf['Cumulative P&L (Unfiltered)'], name='Standard Strategy (Unfiltered)', mode='lines+markers'))
+            
+            if eval_filtered:
+                df_fil = pd.DataFrame(eval_filtered).sort_values('sell_date')
+                df_fil['Cumulative P&L (Filtered)'] = df_fil['pnl'].cumsum()
+                fig.add_trace(go.Scatter(x=df_fil['sell_date'], y=df_fil['Cumulative P&L (Filtered)'], name='Filtered Strategy (Hypothesis)', mode='lines+markers'))
+                
+            fig.update_layout(title="Walk-Forward Period Cumulative Profit/Loss (₹)", xaxis_title="Date", yaxis_title="Profit/Loss (₹)")
+            st.plotly_chart(fig, width="stretch")
+            
+        st.subheader("📝 Detailed Split-Phase Trade Logs")
+        if 'all_trades' in res and res['all_trades']:
+            all_trades_df = pd.DataFrame(res['all_trades'])
+            
+            # Filter by ticker
+            available_tickers = sorted(all_trades_df['Stock'].unique())
+            selected_ticker = st.selectbox("Select Ticker", available_tickers, key="selected_log_ticker_t4")
+            filtered_trades_df = all_trades_df[all_trades_df['Stock'] == selected_ticker].copy()
+            
+            # Reorder columns to put Phase & Execution Status in front
+            cols_order = ['Stock', 'Phase', 'Execution Status', 'buy_date', 'buy_price', 'quantity', 'sell_date', 'sell_price', 'pnl', 'returns', 'holding_period', 'status']
+            existing_cols = [c for c in cols_order if c in filtered_trades_df.columns]
+            other_cols = [c for c in filtered_trades_df.columns if c not in existing_cols]
+            filtered_trades_df = filtered_trades_df[existing_cols + other_cols].sort_values(by='buy_date', ascending=False)
+            
+            # Style the execution status
+            def style_status(row):
+                bg_color = ''
+                if row['Phase'] == 'Warm-up':
+                    bg_color = 'background-color: #f1f3f5; color: #6c757d; font-style: italic;'
+                elif row['Execution Status'] == 'Filtered Out':
+                    bg_color = 'background-color: #fff3cd; color: #856404;'
+                elif row['Execution Status'] == 'Taken':
+                    ret_val = row.get('returns')
+                    if pd.notna(ret_val):
+                        if ret_val > 0:
+                            bg_color = 'background-color: #d4edda; color: #155724; font-weight: bold;'
+                        else:
+                            bg_color = 'background-color: #f8d7da; color: #721c24; font-weight: bold;'
+                    else:
+                        bg_color = 'background-color: #e2e3e5; color: #383d41;' # Open/pending trades
+                return [bg_color] * len(row)
+                
+            if hasattr(filtered_trades_df.style, 'apply'):
+                styled_trades = filtered_trades_df.style.apply(style_status, axis=1)
+            else:
+                styled_trades = filtered_trades_df
+                
+            st.dataframe(styled_trades, width="stretch")
+            st.download_button(f"Export Trade Logs ({selected_ticker})", filtered_trades_df.to_csv(index=False), f"trade_log_{selected_ticker}.csv", "text/csv")
+        else:
+            st.info("No trades were generated in the selected period.")
+
+# ----------------- TAB 5: ABOUT -----------------
+with tab5:
+    st.header("ℹ️ About the Strategy & Developer")
+    
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 20px; margin-bottom: 20px;">
+        <img src="https://avatars.githubusercontent.com/u/67477110?v=4" style="width: 100px; height: 100px; border-radius: 8px;" />
+        <div>
+            <h3 style="margin: 0; font-weight: bold; font-size: 24px;">Kaushik Jegannathan</h3>
+            <div style="margin-top: 8px; font-size: 16px;">
+                <span style="margin-right: 25px;">🔗 <b>LinkedIn</b>: <a href="https://in.linkedin.com/in/kaushik-jegannathan-02757626" target="_blank">kaushik-jegannathan-02757626</a></span>
+                <span>🐙 <b>GitHub</b>: <a href="https://github.com/kaushiktk" target="_blank">kaushiktk</a></span>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    st.subheader("📈 Strategy Theory & Execution Logic")
+    
+    st.markdown("""
+    This application automates and backtests swing-trading strategies using the **Donchian Channel**, structured across three phases:
+    
+    #### 1. Donchian Channel Indicator
+    The Donchian Channel is a trend-following band indicator developed by Richard Donchian. It plots three lines:
+    * **Upper Band**: The maximum high price over a chosen channel period ($H$). Represents local resistance.
+    * **Lower Band**: The minimum low price over a chosen channel period ($L$). Represents local support.
+    * **Midline**: The average of the Upper and Lower bands, acting as the local fair value.
+    
+    #### 2. Entry and Exit Logic
+    * **Entry Trigger (Buy next Open)**: Generated on day $T$ when the price touches or breaches the **Lower Band** (oversold support). The trade executes at day $T+1$'s Open price.
+    * **Exit Trigger (Sell next Open)**: Generated on day $T$ when the price touches or breaches the **Upper Band** (overbought resistance). The trade closes at day $T+1$'s Open price.
+    
+    #### 3. Incremental Walk-Forward Optimization
+    To prevent data leakage and adapt to market shifts, the system implements walk-forward evaluation:
+    * **Warm-up**: The first $N$ trades of any ticker are skipped. They are analyzed purely to generate a baseline.
+    * **Dynamic Filtering**: Any subsequent trade is taken **only if** the running win rate of all previously generated signals (taken or bypassed) exceeds the user-defined threshold (e.g. 75%) and the average/median return is positive.
+    """)
+    
+    st.markdown("---")
+    
+    st.subheader("📦 Under-the-Hood Stack & Packages")
+    st.markdown("""
+    This dashboard is built on a modern Python quant-tech stack:
+    * **Frontend Framework**: [Streamlit](https://streamlit.io/) — for creating interactive dashboards.
+    * **Data Fetching**: [yfinance](https://github.com/ranarousbih/yfinance) — for parallelized downloading of historical NSE/BSE stock data.
+    * **Numerical Processing**: [NumPy](https://numpy.org/) and [Pandas](https://pandas.pydata.org/) — for high-performance rolling calculations and time-series manipulation.
+    * **Charting Engines**: [Plotly Express](https://plotly.com/python/) and [Plotly Graph Objects](https://plotly.com/python/graph-objects/) — for interactive canvas renderings of cumulative profits and metrics.
+    """)
 
 # Footer Disclaimer
 st.markdown("---")
